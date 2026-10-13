@@ -241,9 +241,11 @@ var PiRpcProcess = class _PiRpcProcess {
     const lines = this.preludeLines.splice(0, this.preludeLines.length);
     return lines;
   }
-  async prompt(message, images = []) {
-    const res = await this.request({ type: "prompt", message, images });
+  async prompt(message, images = [], streamingBehavior) {
+    const res = await this.request({ type: "prompt", message, images, streamingBehavior });
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`);
+    const disposition = res.data?.disposition;
+    return disposition === "queued" || disposition === "handled" ? disposition : "started";
   }
   async steer(message, images = []) {
     const res = await this.request({ type: "steer", message, images });
@@ -900,6 +902,10 @@ var PiAcpSession = class {
   // completes only when `agent_settled` is emitted, so the loop spans `agent_start`
   // through `agent_settled`.
   inAgentLoop = false;
+  // Pi run state regardless of who started it; extensions can start runs on their own.
+  piRunActive = false;
+  // pi queued this turn's prompt as a follow-up of a run the adapter had not seen start.
+  turnPromptQueued = false;
   // pi accepts a steer even after its final queue drain, leaving it queued for the
   // next prompt. Settlement clears pi's queue and replays those steers in this turn.
   turnSteers = [];
@@ -959,7 +965,7 @@ var PiAcpSession = class {
     const expandedMessage = expandSlashCommand(message, this.fileCommands);
     const turnPromise = new Promise((resolve4, reject) => {
       const queued = { message: expandedMessage, images, resolve: resolve4, reject };
-      if (this.pendingTurn) {
+      if (this.pendingTurn || this.piRunActive) {
         this.turnQueue.push(queued);
         this.emit({
           sessionUpdate: "agent_message_chunk",
@@ -992,7 +998,7 @@ var PiAcpSession = class {
         _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
       });
     }
-    if (this.turnSteers.length) await this.proc.clearQueue().catch(() => void 0);
+    if (this.turnSteers.length || this.turnPromptQueued) await this.proc.clearQueue().catch(() => void 0);
     await this.proc.abort();
   }
   wasCancelRequested() {
@@ -1048,6 +1054,7 @@ var PiAcpSession = class {
   startTurn(t) {
     this.cancelRequested = false;
     this.turnSteers = [];
+    this.turnPromptQueued = false;
     this.pendingTurn = { resolve: t.resolve, reject: t.reject };
     this.emit({
       sessionUpdate: "session_info_update",
@@ -1057,24 +1064,38 @@ var PiAcpSession = class {
   }
   sendPrompt(message, images) {
     this.inAgentLoop = false;
-    this.proc.prompt(message, images).catch((err) => {
-      void this.flushEmits().finally(() => {
-        const authErr = maybeAuthRequiredError(err);
-        if (authErr) {
-          this.pendingTurn?.reject(authErr);
-        } else {
-          const reason = this.cancelRequested ? "cancelled" : "error";
-          this.pendingTurn?.resolve(reason);
+    const turn = this.pendingTurn;
+    this.proc.prompt(message, images, "followUp").then(
+      (disposition) => {
+        if (!turn || turn !== this.pendingTurn) return;
+        if (disposition === "queued") {
+          this.turnPromptQueued = true;
+          if (this.cancelRequested) void this.proc.clearQueue().catch(() => void 0);
         }
-        this.pendingTurn = null;
-        this.inAgentLoop = false;
-        this.emit({
-          sessionUpdate: "session_info_update",
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+        if (disposition === "handled") {
+          this.inAgentLoop = false;
+          void this.finishTurn(turn);
+        }
+      },
+      (err) => {
+        void this.flushEmits().finally(() => {
+          const authErr = maybeAuthRequiredError(err);
+          if (authErr) {
+            this.pendingTurn?.reject(authErr);
+          } else {
+            const reason = this.cancelRequested ? "cancelled" : "error";
+            this.pendingTurn?.resolve(reason);
+          }
+          this.pendingTurn = null;
+          this.inAgentLoop = false;
+          this.emit({
+            sessionUpdate: "session_info_update",
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          });
         });
-      });
-      void err;
-    });
+        void err;
+      }
+    );
   }
   handlePiEvent(ev) {
     const type = String(ev.type ?? "");
@@ -1333,6 +1354,13 @@ var PiAcpSession = class {
       }
       case "agent_start": {
         this.inAgentLoop = true;
+        if (!this.piRunActive && !this.pendingTurn) {
+          this.emit({
+            sessionUpdate: "session_info_update",
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
+          });
+        }
+        this.piRunActive = true;
         break;
       }
       case "turn_end": {
@@ -1340,28 +1368,37 @@ var PiAcpSession = class {
       }
       case "agent_settled": {
         this.inAgentLoop = false;
-        void this.settleTurn();
+        this.piRunActive = false;
+        if (this.pendingTurn) void this.settleTurn(this.pendingTurn);
+        else this.startNextTurn();
         break;
       }
       default:
         break;
     }
   }
-  async settleTurn() {
+  async settleTurn(turn) {
     await Promise.allSettled(this.inflightSteers);
     const unconsumed = await this.takeUnconsumedSteers();
-    if (unconsumed.length && this.pendingTurn && !this.cancelRequested) {
+    if (unconsumed.length && this.pendingTurn === turn && !this.cancelRequested) {
       this.sendPrompt(
         unconsumed.map((s) => s.message).join("\n\n"),
         unconsumed.flatMap((s) => s.images)
       );
       return;
     }
+    await this.finishTurn(turn);
+  }
+  async finishTurn(turn) {
     await this.flushEmits();
+    if (turn !== this.pendingTurn) return;
     const reason = this.cancelRequested ? "cancelled" : "end_turn";
-    this.pendingTurn?.resolve(reason);
+    turn.resolve(reason);
     this.pendingTurn = null;
-    const next = this.turnQueue.shift();
+    this.startNextTurn();
+  }
+  startNextTurn() {
+    const next = this.piRunActive ? void 0 : this.turnQueue.shift();
     if (next) {
       this.emit({
         sessionUpdate: "agent_message_chunk",
@@ -1371,7 +1408,7 @@ var PiAcpSession = class {
     } else {
       this.emit({
         sessionUpdate: "session_info_update",
-        _meta: { piAcp: { queueDepth: 0, running: false } }
+        _meta: { piAcp: { queueDepth: this.turnQueue.length, running: this.piRunActive } }
       });
     }
   }

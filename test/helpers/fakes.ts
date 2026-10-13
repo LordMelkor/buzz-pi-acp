@@ -42,8 +42,18 @@ export class FakePiRpcProcess {
     for (const h of this.handlers) h(ev)
   }
 
-  async prompt(message: string, attachments: unknown[] = []): Promise<void> {
+  readonly promptStreamingBehaviors: Array<'steer' | 'followUp' | undefined> = []
+  // Dispositions pi answers prompts with, in order; 'started' once exhausted.
+  readonly promptDispositions: Array<'started' | 'queued' | 'handled'> = []
+
+  async prompt(
+    message: string,
+    attachments: unknown[] = [],
+    streamingBehavior?: 'steer' | 'followUp'
+  ): Promise<'started' | 'queued' | 'handled'> {
     this.prompts.push({ message, attachments })
+    this.promptStreamingBehaviors.push(streamingBehavior)
+    return this.promptDispositions.shift() ?? 'started'
   }
 
   // Models pi's steering queue: `steer` enqueues, `consumeSteers` drains it into the

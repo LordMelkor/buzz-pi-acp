@@ -30,7 +30,13 @@ function stripAnsi(s: string): string {
 }
 
 type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | {
+      type: 'prompt'
+      id?: string
+      message: string
+      images?: unknown[]
+      streamingBehavior?: PiStreamingBehavior
+    }
   | { type: 'steer'; id?: string; message: string; images?: unknown[] }
   | { type: 'abort'; id?: string }
   | { type: 'clear_queue'; id?: string }
@@ -55,6 +61,10 @@ type PiRpcCommand =
   | { type: 'get_messages'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
+
+type PiStreamingBehavior = 'steer' | 'followUp'
+
+type PiPromptDisposition = 'started' | 'queued' | 'handled'
 
 type PiRpcResponse = {
   type: 'response'
@@ -247,9 +257,15 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+  async prompt(
+    message: string,
+    images: unknown[] = [],
+    streamingBehavior?: PiStreamingBehavior
+  ): Promise<PiPromptDisposition> {
+    const res = await this.request({ type: 'prompt', message, images, streamingBehavior })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const disposition = (res.data as { disposition?: string } | undefined)?.disposition
+    return disposition === 'queued' || disposition === 'handled' ? disposition : 'started'
   }
 
   async steer(message: string, images: unknown[] = []): Promise<'queued' | 'handled'> {
